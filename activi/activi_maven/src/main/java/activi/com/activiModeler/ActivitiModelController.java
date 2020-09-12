@@ -1,0 +1,149 @@
+package activi.com.activiModeler;
+
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.activiti.bpmn.converter.BpmnXMLConverter;
+import org.activiti.bpmn.model.BpmnModel;
+import org.activiti.editor.constants.ModelDataJsonConstants;
+import org.activiti.editor.language.json.converter.BpmnJsonConverter;
+import org.activiti.engine.ProcessEngine;
+import org.activiti.engine.RepositoryService;
+import org.activiti.engine.repository.Deployment;
+import org.activiti.engine.repository.Model;
+import org.activiti.engine.runtime.ProcessInstance;
+import org.activiti.engine.task.Task;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseBody;
+
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+
+@RequestMapping("/activiModeler/edit")
+@Controller
+public class ActivitiModelController {
+
+	private static final Logger log = LogManager.getLogger(ActivitiModelController.class);
+
+	@Autowired
+	ProcessEngine processEngine;
+	@Autowired
+	ObjectMapper objectMapper;
+
+	/**
+	 * 新建一个空模型
+	 */
+	@RequestMapping("/create")
+	public void newModel(HttpServletResponse response,
+						 @RequestParam(value = "name") String name,
+						 @RequestParam(value = "description") String description,
+						 @RequestParam(value = "key") String key) throws IOException {
+		RepositoryService repositoryService = processEngine.getRepositoryService();
+		//初始化一个空模型
+		/**
+		 * 当空模型初始化后，act_re_model表中会添加一条记录，
+		 * 但只有点击页面保存键，EDITOR_SOURCE_EXTRA才会产生值，从而有效
+		 */
+		Model model = repositoryService.newModel();
+		//设置一些默认信息
+		int revision = 1;
+		ObjectNode modelNode = objectMapper.createObjectNode();
+		modelNode.put(ModelDataJsonConstants.MODEL_NAME, name);
+		modelNode.put(ModelDataJsonConstants.MODEL_DESCRIPTION, description);
+		modelNode.put(ModelDataJsonConstants.MODEL_REVISION, revision);
+
+		model.setName(name);
+		model.setKey(key);
+		model.setMetaInfo(modelNode.toString());
+
+		repositoryService.saveModel(model);
+		String id = model.getId();
+
+		//完善ModelEditorSource
+		ObjectNode editorNode = objectMapper.createObjectNode();
+		editorNode.put("id", "canvas");
+		editorNode.put("resourceId", "canvas");
+		ObjectNode stencilSetNode = objectMapper.createObjectNode();
+		stencilSetNode.put("namespace",
+				"http://b3mn.org/stencilset/bpmn2.0#");
+		editorNode.put("stencilset", stencilSetNode);
+		repositoryService.addModelEditorSource(id, editorNode.toString().getBytes("utf-8"));
+		response.sendRedirect("/modeler.html?modelId=" + id);
+	}
+
+	/**
+	 * 获取所有模型
+	 */
+	@RequestMapping("/modelList")
+	@ResponseBody
+	public Object modelList() {
+		RepositoryService repositoryService = processEngine.getRepositoryService();
+		return repositoryService.createModelQuery().list();
+	}
+
+	/**
+	 * 发布模型为流程定义
+	 */
+	@RequestMapping("/deploy")
+	@ResponseBody
+	public Object deploy(@RequestParam(value = "modelId") String modelId) throws Exception {
+
+		//获取模型
+		RepositoryService repositoryService = processEngine.getRepositoryService();
+		Model modelData = repositoryService.getModel(modelId);
+		byte[] bytes = repositoryService.getModelEditorSource(modelData.getId());
+
+		if (bytes == null) {
+			return "模型数据为空，请先设计流程并成功保存，再进行发布。";
+		}
+
+		JsonNode modelNode = new ObjectMapper().readTree(bytes);
+
+		BpmnModel model = new BpmnJsonConverter().convertToBpmnModel(modelNode);
+		if (model.getProcesses().size() == 0) {
+			return "数据模型不符要求，请至少设计一条主线流程。";
+		}
+		byte[] bpmnBytes = new BpmnXMLConverter().convertToXML(model);
+
+		//发布流程
+		String processName = modelData.getName() + ".bpmn20.xml";
+		Deployment deployment = repositoryService.createDeployment()
+				.name(modelData.getName())
+				.addString(processName, new String(bpmnBytes, "UTF-8"))
+				.deploy();
+		modelData.setDeploymentId(deployment.getId());
+		repositoryService.saveModel(modelData);
+
+		return "SUCCESS";
+	}
+
+	/**
+	 * 启动流程
+	 */
+	@RequestMapping("/start")
+	@ResponseBody
+	public Object startProcess(@RequestParam(value = "keyName") String keyName) {
+		ProcessInstance process = processEngine.getRuntimeService().startProcessInstanceByKey(keyName);
+
+		return process.getId() + " : " + process.getProcessDefinitionId();
+	}
+
+	/**
+	 * 提交任务
+	 */
+	@RequestMapping("/run")
+	@ResponseBody
+	public Object run(@RequestParam(value = "processInstanceId") String processInstanceId) {
+		Task task = processEngine.getTaskService().createTaskQuery().processInstanceId(processInstanceId).singleResult();
+
+		log.info("task {} find ", task.getId());
+		processEngine.getTaskService().complete(task.getId());
+		return "SUCCESS";
+	}
+}
